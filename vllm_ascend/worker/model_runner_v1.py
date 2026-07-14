@@ -241,6 +241,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    prefill_req_indices: list[int]
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -2062,48 +2063,20 @@ class NPUModelRunner(GPUModelRunner):
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
-            if get_tp_group().rank_in_group == 0:
-                prefill_req_indices = [
-                    req_index
-                    for req_index in range(num_reqs)
-                    if self.input_batch.num_computed_tokens_cpu[req_index]
-                    < self.input_batch.num_prompt_tokens[req_index]
-                    and self.input_batch.num_computed_tokens_cpu[req_index]
-                    + num_scheduled_tokens_np[req_index]
-                    >= self.input_batch.num_prompt_tokens[req_index]
-                ]
-                if prefill_req_indices:
-                    if get_ascend_config().enable_reduce_sample:
-                        logger.warning_once(
-                            "PREFILL_TOP3 is skipped when reduce sampling is enabled."
-                        )
-                    else:
-                        torch.npu.synchronize()
-                        prefill_logits = (
-                            logits[:num_reqs][prefill_req_indices]
-                            .to(torch.float32)
-                            .cpu()
-                        )
-                        prefill_probs = torch.softmax(prefill_logits, dim=-1)
-                        top_probs, top_token_ids = torch.topk(
-                            prefill_probs,
-                            k=min(3, prefill_probs.shape[-1]),
-                            dim=-1,
-                        )
-                        for request_id, token_ids, probabilities in zip(
-                            (
-                                self.input_batch.req_ids[req_index]
-                                for req_index in prefill_req_indices
-                            ),
-                            top_token_ids.tolist(),
-                            top_probs.tolist(),
-                        ):
-                            logger.info(
-                                "PREFILL_TOP3 request_id=%s token_ids=%s probabilities=%s",
-                                request_id,
-                                token_ids,
-                                probabilities,
-                            )
+            prefill_req_indices = [
+                req_index
+                for req_index in range(num_reqs)
+                if self.input_batch.num_computed_tokens_cpu[req_index]
+                < self.input_batch.num_prompt_tokens[req_index]
+                and self.input_batch.num_computed_tokens_cpu[req_index]
+                + num_scheduled_tokens_np[req_index]
+                >= self.input_batch.num_prompt_tokens[req_index]
+            ]
+            self._log_prefill_top3(
+                logits,
+                prefill_req_indices,
+                "PREFILL_RAW_TOP3",
+            )
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
@@ -2119,6 +2092,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                prefill_req_indices,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -2167,6 +2141,7 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            prefill_req_indices,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -2179,6 +2154,12 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
+
+        self._log_prefill_top3(
+            logits,
+            prefill_req_indices,
+            "PREFILL_CONSTRAINED_TOP3",
+        )
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -2351,6 +2332,47 @@ class NPUModelRunner(GPUModelRunner):
             async_output.async_copy_ready_event,
         )
         return async_output
+
+    def _log_prefill_top3(
+        self,
+        logits: torch.Tensor,
+        prefill_req_indices: list[int],
+        log_name: str,
+    ) -> None:
+        if not prefill_req_indices or get_tp_group().rank_in_group != 0:
+            return
+        if get_ascend_config().enable_reduce_sample:
+            logger.warning_once(
+                "%s is skipped when reduce sampling is enabled.", log_name
+            )
+            return
+
+        torch.npu.synchronize()
+        num_reqs = self.input_batch.num_reqs
+        prefill_logits = (
+            logits[:num_reqs][prefill_req_indices].to(torch.float32).cpu()
+        )
+        prefill_probs = torch.softmax(prefill_logits, dim=-1)
+        top_probs, top_token_ids = torch.topk(
+            prefill_probs,
+            k=min(3, prefill_probs.shape[-1]),
+            dim=-1,
+        )
+        for request_id, token_ids, probabilities in zip(
+            (
+                self.input_batch.req_ids[req_index]
+                for req_index in prefill_req_indices
+            ),
+            top_token_ids.tolist(),
+            top_probs.tolist(),
+        ):
+            logger.info(
+                "%s request_id=%s token_ids=%s probabilities=%s",
+                log_name,
+                request_id,
+                token_ids,
+                probabilities,
+            )
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
