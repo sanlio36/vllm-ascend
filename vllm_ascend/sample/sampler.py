@@ -1,6 +1,7 @@
 import torch
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
@@ -11,8 +12,50 @@ from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_stream, npu_stream_switch
 
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
+PREFILL_LOG_TOP_K = 3
 
 _SAMPLING_EPS = 1e-5
+
+logger = init_logger(__name__)
+
+
+def log_prefill_topk(
+    logits: torch.Tensor,
+    request_ids: list[str],
+    request_indices: list[int],
+    enable_reduce_sample: bool,
+) -> None:
+    if not request_indices:
+        return
+
+    if enable_reduce_sample:
+        logger.warning_once(
+            "Prefill top-k token logging is skipped when reduce sampling is enabled."
+        )
+        return
+
+    top_k = min(PREFILL_LOG_TOP_K, logits.shape[-1])
+    prefill_logits = logits[request_indices].to(torch.float32)
+    top_logits, top_token_ids = torch.topk(prefill_logits, k=top_k, dim=-1)
+    log_normalizer = torch.logsumexp(prefill_logits, dim=-1, keepdim=True)
+    top_probs = torch.exp(top_logits - log_normalizer)
+
+    # Diagnostic logging intentionally synchronizes once per request prefill.
+    top_token_ids_cpu = top_token_ids.cpu().tolist()
+    top_probs_cpu = top_probs.cpu().tolist()
+    for request_id, token_ids, probabilities in zip(
+        request_ids, top_token_ids_cpu, top_probs_cpu
+    ):
+        top_tokens = [
+            {"token_id": token_id, "probability": probability}
+            for token_id, probability in zip(token_ids, probabilities)
+        ]
+        logger.info(
+            "Prefill sampling top-%d tokens for request %s: %s",
+            top_k,
+            request_id,
+            top_tokens,
+        )
 
 
 def random_sample(

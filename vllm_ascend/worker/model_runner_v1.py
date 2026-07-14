@@ -124,7 +124,7 @@ from vllm_ascend.eplb.utils import model_register
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
-from vllm_ascend.sample.sampler import AscendSampler
+from vllm_ascend.sample.sampler import AscendSampler, log_prefill_topk
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -2317,6 +2317,29 @@ class NPUModelRunner(GPUModelRunner):
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
+            if get_tp_group().rank_in_group == 0:
+                num_reqs = self.input_batch.num_reqs
+                discarded_req_indices = set(
+                    self.discard_request_indices.np[: self.num_discarded_requests]
+                )
+                prefill_req_indices = [
+                    req_index
+                    for req_index, output_token_ids in enumerate(
+                        self.input_batch.req_output_token_ids[:num_reqs]
+                    )
+                    if not output_token_ids
+                    and req_index not in discarded_req_indices
+                ]
+                prefill_request_ids = [
+                    self.input_batch.req_ids[req_index]
+                    for req_index in prefill_req_indices
+                ]
+                log_prefill_topk(
+                    logits[:num_reqs],
+                    prefill_request_ids,
+                    prefill_req_indices,
+                    get_ascend_config().enable_reduce_sample,
+                )
             if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
                 max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
                 self.sampler.prepare_sampling(max_topk)
