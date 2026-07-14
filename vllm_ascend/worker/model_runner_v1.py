@@ -2137,6 +2137,35 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
+        if spec_decode_metadata is None and get_tp_group().rank_in_group == 0:
+            prefill_req_ids = {
+                request.req_id for request in scheduler_output.scheduled_new_reqs
+            }
+            prefill_req_ids.update(
+                req_id
+                for req_id in scheduler_output.scheduled_cached_reqs.req_ids
+                if scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
+            )
+            discarded_req_indices = set(
+                self.discard_request_indices.np[: self.num_discarded_requests]
+            )
+            prefill_req_indices = [
+                req_index
+                for req_index, req_id in enumerate(self.input_batch.req_ids)
+                if req_id in prefill_req_ids
+                and req_index not in discarded_req_indices
+            ]
+            prefill_request_ids = [
+                self.input_batch.req_ids[req_index]
+                for req_index in prefill_req_indices
+            ]
+            log_prefill_topk(
+                logits[: self.input_batch.num_reqs],
+                prefill_request_ids,
+                prefill_req_indices,
+                get_ascend_config().enable_reduce_sample,
+            )
+
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
@@ -2317,29 +2346,6 @@ class NPUModelRunner(GPUModelRunner):
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
-            if get_tp_group().rank_in_group == 0:
-                num_reqs = self.input_batch.num_reqs
-                discarded_req_indices = set(
-                    self.discard_request_indices.np[: self.num_discarded_requests]
-                )
-                prefill_req_indices = [
-                    req_index
-                    for req_index, output_token_ids in enumerate(
-                        self.input_batch.req_output_token_ids[:num_reqs]
-                    )
-                    if not output_token_ids
-                    and req_index not in discarded_req_indices
-                ]
-                prefill_request_ids = [
-                    self.input_batch.req_ids[req_index]
-                    for req_index in prefill_req_indices
-                ]
-                log_prefill_topk(
-                    logits[:num_reqs],
-                    prefill_request_ids,
-                    prefill_req_indices,
-                    get_ascend_config().enable_reduce_sample,
-                )
             if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
                 max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
                 self.sampler.prepare_sampling(max_topk)
