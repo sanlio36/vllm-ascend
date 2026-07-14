@@ -124,7 +124,7 @@ from vllm_ascend.eplb.utils import model_register
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
-from vllm_ascend.sample.sampler import AscendSampler, log_prefill_topk
+from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -2062,6 +2062,49 @@ class NPUModelRunner(GPUModelRunner):
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+            if get_tp_group().rank_in_group == 0:
+                prefill_req_indices = [
+                    req_index
+                    for req_index in range(num_reqs)
+                    if self.input_batch.num_computed_tokens_cpu[req_index]
+                    < self.input_batch.num_prompt_tokens[req_index]
+                    and self.input_batch.num_computed_tokens_cpu[req_index]
+                    + num_scheduled_tokens_np[req_index]
+                    >= self.input_batch.num_prompt_tokens[req_index]
+                ]
+                if prefill_req_indices:
+                    if get_ascend_config().enable_reduce_sample:
+                        logger.warning_once(
+                            "PREFILL_TOP3 is skipped when reduce sampling is enabled."
+                        )
+                    else:
+                        torch.npu.synchronize()
+                        prefill_logits = (
+                            logits[:num_reqs][prefill_req_indices]
+                            .to(torch.float32)
+                            .cpu()
+                        )
+                        prefill_probs = torch.softmax(prefill_logits, dim=-1)
+                        top_probs, top_token_ids = torch.topk(
+                            prefill_probs,
+                            k=min(3, prefill_probs.shape[-1]),
+                            dim=-1,
+                        )
+                        for request_id, token_ids, probabilities in zip(
+                            (
+                                self.input_batch.req_ids[req_index]
+                                for req_index in prefill_req_indices
+                            ),
+                            top_token_ids.tolist(),
+                            top_probs.tolist(),
+                        ):
+                            logger.info(
+                                "PREFILL_TOP3 request_id=%s token_ids=%s probabilities=%s",
+                                request_id,
+                                token_ids,
+                                probabilities,
+                            )
+
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
                 scheduler_output,
@@ -2136,35 +2179,6 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
-
-        if spec_decode_metadata is None and get_tp_group().rank_in_group == 0:
-            prefill_req_ids = {
-                request.req_id for request in scheduler_output.scheduled_new_reqs
-            }
-            prefill_req_ids.update(
-                req_id
-                for req_id in scheduler_output.scheduled_cached_reqs.req_ids
-                if scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
-            )
-            discarded_req_indices = set(
-                self.discard_request_indices.np[: self.num_discarded_requests]
-            )
-            prefill_req_indices = [
-                req_index
-                for req_index, req_id in enumerate(self.input_batch.req_ids)
-                if req_id in prefill_req_ids
-                and req_index not in discarded_req_indices
-            ]
-            prefill_request_ids = [
-                self.input_batch.req_ids[req_index]
-                for req_index in prefill_req_indices
-            ]
-            log_prefill_topk(
-                logits[: self.input_batch.num_reqs],
-                prefill_request_ids,
-                prefill_req_indices,
-                get_ascend_config().enable_reduce_sample,
-            )
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
